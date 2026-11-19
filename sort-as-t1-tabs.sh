@@ -4,6 +4,10 @@
 # After you paste the command, it asks for the first and last tab in the
 # range, checks that it can read Chrome and NCC, asks you to confirm every
 # tab is open, then asks whether to sort by NA/NB row or by rack triplet.
+# Duplicate copies of an end tab are included. The span is the leftmost
+# first tab through the rightmost last tab. One copy of each link is kept.
+# The script checks the tab strip after the move and does not say it is
+# done until that strip matches the sort.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/Cristian8281/sort-as-t1-tabs/main/sort-as-t1-tabs.sh | bash
@@ -68,6 +72,8 @@ def link_key(url):
 def ask_range():
     print("Paste the first and last tab in the range you want sorted.")
     print("The sort includes those two tabs and every tab between them.")
+    print("Duplicate copies are included, from the leftmost first tab to the rightmost last tab.")
+    print("One copy of each link is kept.")
     print()
     first = ask("URL of the first tab: ")
     last = ask("URL of the last tab: ")
@@ -264,14 +270,13 @@ def find_range(windows, first_url, last_url):
     for wid, tabs in windows.items():
         starts = [i for i, tab in enumerate(tabs) if link_key(tab["url"]) == start_key]
         ends = [i for i, tab in enumerate(tabs) if link_key(tab["url"]) == end_key]
-        for start in starts:
-            later = [end for end in ends if end >= start]
-            if later:
-                found.append((wid, start, later[0], tabs))
+        if not starts or not ends or ends[-1] < starts[0]:
+            continue
+        found.append((wid, starts[0], ends[-1], tabs))
     if not found:
         die("Those two tabs are not open together in one Chrome window, with the first tab left of the last. Nothing was moved.")
     if len(found) > 1:
-        die("That first or last tab is open more than once. Close the extra copy so the range is unique. Nothing was moved.")
+        die("That range is open in more than one Chrome window. Close the extra one and run this again. Nothing was moved.")
     wid, start, end, tabs = found[0]
     block = tabs[start:end + 1]
     stray = [tab for tab in block if link_key(tab["url"]) is None]
@@ -285,39 +290,44 @@ def as_string(value):
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def applescript(source):
+    try:
+        return subprocess.check_output(["osascript", "-e", source], text=True, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as exc:
+        die(exc.output.strip() or "Chrome reorder failed.")
+
+
 def reorder(window_id, old_ids, urls, boundary_id):
-    script = r'''
+    url_list = ", ".join(as_string(url) for url in urls)
+    old_list = ", ".join(as_string(tid) for tid in reversed(old_ids))
+    boundary = as_string(boundary_id or "")
+    create = f'''
 tell application "Google Chrome"
-  set w to window id WID
-  set createdIds to {}
+  set w to window id {int(window_id)}
+  set createdIds to {{}}
+  set urlList to {{{url_list}}}
+  set boundary to {boundary}
   try
-    set n to count of tabs of w
-    set startIdx to 0
-    repeat with i from 1 to n
-      if (id of tab i of w as text) is FIRST then
-        set startIdx to i
-        exit repeat
+    set urlCount to count of urlList
+    repeat with k from 1 to urlCount
+      set targetUrl to item k of urlList as text
+      if boundary is "" then
+        set newTab to make new tab at end of tabs of w with properties {{URL:targetUrl}}
+      else
+        set insertAt to 0
+        set n to count of tabs of w
+        repeat with i from 1 to n
+          if (id of tab i of w as text) is boundary then
+            set insertAt to i
+            exit repeat
+          end if
+        end repeat
+        if insertAt is 0 then error "the tab after the range moved"
+        set newTab to make new tab at before tab insertAt of w with properties {{URL:targetUrl}}
       end if
+      set end of createdIds to (id of newTab as text)
+      delay 0.12
     end repeat
-    if startIdx is 0 then error "the tab range is gone"
-    set lastIdx to startIdx + COUNT - 1
-    if lastIdx > n then error "the tab range moved"
-CHECKS
-    set insertAt to lastIdx + 1
-    if insertAt > (count of tabs of w) then
-INSERT_END
-    else
-      if BOUNDARY is not "" then
-        if (id of tab insertAt of w as text) is not BOUNDARY then error "the tab after the range moved"
-      end if
-INSERT_BEFORE
-    end if
-    set newStart to startIdx + COUNT
-VERIFY
-    repeat COUNT times
-      close tab startIdx of w
-    end repeat
-    return "reordered"
   on error errMsg
     set n2 to count of tabs of w
     repeat with i from n2 to 1 by -1
@@ -326,39 +336,72 @@ VERIFY
     end repeat
     error errMsg
   end try
+  set out to ""
+  set nCreated to count of createdIds
+  repeat with k from 1 to nCreated
+    set out to out & (item k of createdIds as text) & linefeed
+  end repeat
+  return out
 end tell
 '''
-    checks = []
-    for offset, tid in enumerate(old_ids):
-        checks.append(
-            f'    if (id of tab (startIdx + {offset}) of w as text) is not "{tid}" then error "tabs changed before reorder"'
-        )
-    insert_end = []
-    insert_before = []
-    verify = []
-    for index, url in enumerate(urls):
-        insert_end.append(f"      set newTab to make new tab at end of tabs of w with properties {{URL:{as_string(url)}}}")
-        insert_end.append("      set end of createdIds to (id of newTab as text)")
-        insert_before.append(f"      set newTab to make new tab at before tab insertAt of w with properties {{URL:{as_string(url)}}}")
-        insert_before.append("      set end of createdIds to (id of newTab as text)")
-        insert_before.append("      set insertAt to insertAt + 1")
-        verify.append(
-            f'    if URL of tab (newStart + {index}) of w is not {as_string(url)} then error "new tab URL did not land in order"'
-        )
-    script = (
-        script.replace("WID", str(int(window_id)))
-        .replace("FIRST", as_string(old_ids[0]))
-        .replace("COUNT", str(len(old_ids)))
-        .replace("BOUNDARY", as_string(boundary_id or ""))
-        .replace("CHECKS", "\n".join(checks))
-        .replace("INSERT_END", "\n".join(insert_end))
-        .replace("INSERT_BEFORE", "\n".join(insert_before))
-        .replace("VERIFY", "\n".join(verify))
-    )
-    try:
-        subprocess.check_output(["osascript", "-e", script], text=True, stderr=subprocess.STDOUT)
-    except subprocess.CalledProcessError as exc:
-        die(exc.output.strip() or "Chrome reorder failed. Existing tabs were left in place if the new ones could be closed.")
+    created = [line.strip() for line in applescript(create).splitlines() if line.strip()]
+    if len(created) != len(urls):
+        die("Chrome did not open every sorted tab. Nothing else was changed.")
+    close = f'''
+tell application "Google Chrome"
+  set w to window id {int(window_id)}
+  set pending to {{{old_list}}}
+  set passes to 0
+  repeat while (count of pending) > 0 and passes < 8
+    set passes to passes + 1
+    set nClose to count of tabs of w
+    set nextPending to {{}}
+    repeat with k from 1 to (count of pending)
+      set wanted to item k of pending as text
+      set foundIdx to 0
+      repeat with i from nClose to 1 by -1
+        if (id of tab i of w as text) is wanted then
+          set foundIdx to i
+          exit repeat
+        end if
+      end repeat
+      if foundIdx is 0 then
+        -- already closed
+      else
+        close tab foundIdx of w
+        set end of nextPending to wanted
+        set nClose to count of tabs of w
+      end if
+    end repeat
+    set pending to nextPending
+    if (count of pending) > 0 then delay 0.25
+  end repeat
+  if (count of pending) > 0 then error "an original tab stayed open"
+  return "closed"
+end tell
+'''
+    applescript(close)
+    windows = chrome_tabs()
+    tabs = windows.get(str(window_id))
+    if tabs is None:
+        die("Lost the Chrome window after reorder.")
+    by_id = {tab["tid"]: tab for tab in tabs}
+    left = [tid for tid in old_ids if tid in by_id]
+    if left:
+        die(f"{len(left)} original tab(s) stayed open. The sorted tabs are also open.")
+    positions = []
+    for tid, url in zip(created, urls):
+        tab = by_id.get(tid)
+        if tab is None or link_key(tab["url"]) != link_key(url):
+            die("A sorted tab did not stay open at its URL.")
+        positions.append(next(i for i, item in enumerate(tabs) if item["tid"] == tid))
+    if positions != list(range(positions[0], positions[0] + len(positions))):
+        die("The sorted tabs are not in one block.")
+    if boundary_id:
+        boundary_at = next((i for i, item in enumerate(tabs) if item["tid"] == boundary_id), None)
+        if boundary_at != positions[-1] + 1:
+            die("The tab after the range is not where it started.")
+    return created
 
 
 def summarize(ordered, field):
@@ -427,15 +470,34 @@ def main():
     else:
         ordered = sorted(results, key=lambda item: row_key(item["rack"]))
         field = "rack"
-    print(summarize(ordered, field))
-    already = [item["tab"]["tid"] for item in results] == [item["tab"]["tid"] for item in ordered]
-    if already:
+    kept = []
+    seen = set()
+    for item in ordered:
+        key = link_key(item["tab"]["url"])
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(item)
+    dropped = len(ordered) - len(kept)
+    if dropped:
+        print(f"Keeping one copy of each link. {dropped} duplicate tab(s) will be closed.")
+    print(summarize(kept, field))
+    current = []
+    seen = set()
+    for item in results:
+        key = link_key(item["tab"]["url"])
+        if key in seen:
+            continue
+        seen.add(key)
+        current.append(item["tab"]["tid"])
+    if dropped == 0 and current == [item["tab"]["tid"] for item in kept]:
         print("Already in that order. Nothing was moved.")
         return
+    print(f"Reordering {len(kept)} tabs. They will reload.", flush=True)
     reorder(
         wid,
         [item["tab"]["tid"] for item in results],
-        [item["tab"]["url"] for item in ordered],
+        [item["tab"]["url"] for item in kept],
         boundary,
     )
     label = "row" if mode == "row" else "triplet"
