@@ -1,13 +1,12 @@
 #!/bin/bash
-# Sort a marked range of Chrome NCC link tabs.
+# Sort a range of Chrome NCC link tabs.
 #
-# The script asks two things before it moves anything:
-#   1. The divider name that starts the range. The next divider ends it.
-#   2. triplet (RAM, RCK, ZUC) or row (na05, na12, nb05).
+# After you paste the command, it asks for the first and last tab in the
+# range, checks that it can read Chrome and NCC, asks you to confirm every
+# tab is open, then asks whether to sort by NA/NB row or by rack triplet.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/Cristian8281/sort-as-t1-tabs/main/sort-as-t1-tabs.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/Cristian8281/sort-as-t1-tabs/main/sort-as-t1-tabs.sh | bash -s -- --dry-run
 #
 # Requires macOS, Google Chrome, and an NCC login in that Chrome profile.
 # The first run asks Keychain for the Chrome Safe Storage password.
@@ -28,10 +27,9 @@ import sys
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import unquote, urlparse
 
 NCC = "https://ncc.ts.int-x.ai/graphql"
-DRY = "--dry-run" in sys.argv[1:]
 ROW_RE = re.compile(r"^([a-z]+)(\d+)$")
 
 
@@ -46,42 +44,36 @@ def ask(prompt):
         with open("/dev/tty") as tty:
             line = tty.readline()
     except OSError:
-        die("Run this in Terminal so it can ask which tabs to sort. Nothing was moved.")
+        die("Run this in Terminal so it can ask questions. Nothing was moved.")
     if not line:
         die("No answer. Nothing was moved.")
     return line.strip()
 
 
-def checklist():
-    print(
-        """Before this sorts anything, have these ready:
-
-1. A range of tabs in Chrome.
-   Put one tab divider immediately before the first link,
-   and another tab divider immediately after the last link.
-   The tabs between those two dividers are the ones that get sorted.
-
-2. Which order you want.
-   triplet    RAM, RCK, ZUC. The three letters on the memy switch.
-   row        na05, na12, nb05. The NA/NB row on the device in the tab.
-
-Chrome needs to be open and signed in to NCC.
-The first run asks for the Chrome keychain password.
-Nothing moves until you confirm.
-"""
-    )
+def link_parts(url):
+    path = unquote(urlparse(url.strip()).path).strip("/").split("/")
+    if len(path) < 4 or path[0] != "network-entity" or path[1] != "link":
+        return None
+    return path[2], "/".join(path[3:])
 
 
-def choose_mode():
-    start = ask("Starting divider name: ")
-    if not start:
-        die("Need the divider name that starts the range. Nothing was moved.")
-    raw = ask("Sort by [triplet/row]: ").lower()
-    if raw in ("t", "triplet", "1"):
-        return start, "triplet"
-    if raw in ("r", "row", "2", "na", "nb", "na/nb"):
-        return start, "row"
-    die("Type triplet or row. Nothing was moved.")
+def link_key(url):
+    parts = link_parts(url)
+    if not parts:
+        return None
+    device, iface = parts
+    return device.lower(), iface
+
+
+def ask_range():
+    print("Paste the first and last tab in the range you want sorted.")
+    print("The sort includes those two tabs and every tab between them.")
+    print()
+    first = ask("URL of the first tab: ")
+    last = ask("URL of the last tab: ")
+    if link_key(first) is None or link_key(last) is None:
+        die("Both URLs need to be NCC link tabs, like https://ncc.ts.int-x.ai/network-entity/link/... Nothing was moved.")
+    return first, last
 
 
 def chrome_tabs():
@@ -97,7 +89,7 @@ tell application "Google Chrome"
     set wid to id of w as text
     set n to count of tabs of w
     repeat with t from 1 to n
-      set output to output & wid & sep & (id of tab t of w as text) & sep & (URL of tab t of w) & linefeed
+      set output to output & wid & sep & (id of tab t of w as text) & sep & (title of tab t of w) & sep & (URL of tab t of w) & linefeed
     end repeat
   end repeat
   return output
@@ -111,66 +103,11 @@ end tell
     for line in raw.splitlines():
         if not line.strip():
             continue
-        wid, tid, url = line.split("\x1f", 2)
-        windows.setdefault(wid, []).append({"tid": tid, "url": url})
+        wid, tid, title, url = line.split("\x1f", 3)
+        windows.setdefault(wid, []).append({"tid": tid, "title": title, "url": url})
+    if not windows:
+        die("Chrome has no tabs. Nothing was moved.")
     return windows
-
-
-def divider_name(url):
-    if "divider.html" not in url:
-        return None
-    name = (parse_qs(urlparse(url).query).get("name") or [""])[0]
-    return name or None
-
-
-def link_parts(url):
-    path = unquote(urlparse(url).path).strip("/").split("/")
-    if len(path) < 4 or path[0] != "network-entity" or path[1] != "link":
-        return None
-    return path[2], "/".join(path[3:])
-
-
-def divider_names(windows):
-    names = []
-    for tabs in windows.values():
-        for tab in tabs:
-            name = divider_name(tab["url"])
-            if name and name not in names:
-                names.append(name)
-    return names
-
-
-def find_block(windows, start_name):
-    want = start_name.lower()
-    found = []
-    for wid, tabs in windows.items():
-        for i, tab in enumerate(tabs):
-            if (divider_name(tab["url"]) or "").lower() != want:
-                continue
-            end = next((j for j in range(i + 1, len(tabs)) if divider_name(tabs[j]["url"])), None)
-            if end is None:
-                die(
-                    f'"{start_name}" has no divider after it. '
-                    "Put a second divider immediately after the last tab you want sorted. Nothing was moved."
-                )
-            block = tabs[i + 1:end]
-            found.append((wid, tab, tabs[end], block))
-    if not found:
-        names = divider_names(windows)
-        extra = f" Dividers open now: {', '.join(names)}." if names else " No tab dividers are open."
-        die(f'No divider named "{start_name}".{extra} Nothing was moved.')
-    if len(found) > 1:
-        die(f'More than one divider is named "{start_name}". Rename one so the range is unique. Nothing was moved.')
-    wid, start, end, block = found[0]
-    if not block:
-        die(f'Nothing is between "{divider_name(start["url"])}" and "{divider_name(end["url"])}". Nothing was moved.')
-    stray = [t for t in block if link_parts(t["url"]) is None]
-    if stray:
-        die(
-            "A tab inside that range is not an NCC link. "
-            "Move it outside the two dividers and run this again. Nothing was moved."
-        )
-    return wid, start, end, block
 
 
 def chrome_key():
@@ -302,6 +239,48 @@ def lookup(cookie, device, iface):
     return {"triplet": choose_triplet(device, remote), "rack": rack, "remote": remote}
 
 
+def check_access(start_url):
+    print("Checking Chrome and NCC access...")
+    windows = chrome_tabs()
+    tab_count = sum(len(tabs) for tabs in windows.values())
+    print(f"  Chrome is open. Can read {tab_count} tabs in {len(windows)} window(s), including titles and URLs.")
+    key = chrome_key()
+    print("  Keychain access works.")
+    cookie = cookie_header(key)
+    print("  NCC login found.")
+    device, iface = link_parts(start_url)
+    probe = lookup(cookie, device, iface)
+    if probe.get("error"):
+        die(f"NCC did not return that link. {probe['error']} Nothing was moved.")
+    print("  Can read link data from NCC.")
+    print()
+    return windows, cookie
+
+
+def find_range(windows, first_url, last_url):
+    start_key = link_key(first_url)
+    end_key = link_key(last_url)
+    found = []
+    for wid, tabs in windows.items():
+        starts = [i for i, tab in enumerate(tabs) if link_key(tab["url"]) == start_key]
+        ends = [i for i, tab in enumerate(tabs) if link_key(tab["url"]) == end_key]
+        for start in starts:
+            later = [end for end in ends if end >= start]
+            if later:
+                found.append((wid, start, later[0], tabs))
+    if not found:
+        die("Those two tabs are not open together in one Chrome window, with the first tab left of the last. Nothing was moved.")
+    if len(found) > 1:
+        die("That first or last tab is open more than once. Close the extra copy so the range is unique. Nothing was moved.")
+    wid, start, end, tabs = found[0]
+    block = tabs[start:end + 1]
+    stray = [tab for tab in block if link_key(tab["url"]) is None]
+    if stray:
+        die("A tab inside that range is not an NCC link. Move it outside the range and run this again. Nothing was moved.")
+    boundary = tabs[end + 1]["tid"] if end + 1 < len(tabs) else ""
+    return wid, block, boundary
+
+
 def as_string(value):
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -329,7 +308,7 @@ CHECKS
 INSERT_END
     else
       if BOUNDARY is not "" then
-        if (id of tab insertAt of w as text) is not BOUNDARY then error "the divider after the range moved"
+        if (id of tab insertAt of w as text) is not BOUNDARY then error "the tab after the range moved"
       end if
 INSERT_BEFORE
     end if
@@ -393,19 +372,34 @@ def summarize(ordered, field):
     return ", ".join(f"{name} x{count}" for name, count in groups)
 
 
+def ask_sort_mode():
+    print("How should they be sorted?")
+    print("  row       NA/NB row, alphabetically and numerically (na05, na12, nb05)")
+    print("  triplet   rack triplet, alphabetically (RAM, RCK, ZUC)")
+    raw = ask("Sort by [row/triplet]: ").lower()
+    if raw in ("r", "row", "1", "na", "nb", "na/nb"):
+        return "row"
+    if raw in ("t", "triplet", "2"):
+        return "triplet"
+    die("Type row or triplet. Nothing was moved.")
+
+
 def main():
-    checklist()
-    start_name, mode = choose_mode()
-    windows = chrome_tabs()
-    wid, start, end, block = find_block(windows, start_name)
-    end_name = divider_name(end["url"])
-    print(f'Reading {len(block)} tabs between "{divider_name(start["url"])}" and "{end_name}"...', flush=True)
-    key = chrome_key()
-    cookie = cookie_header(key)
-    jobs = []
-    for tab in block:
-        device, iface = link_parts(tab["url"])
-        jobs.append((tab, device, iface))
+    first_url, last_url = ask_range()
+    print()
+    windows, cookie = check_access(first_url)
+    wid, block, boundary = find_range(windows, first_url, last_url)
+    print(f"Found {len(block)} tabs in that range.")
+    print()
+    ready = ask("Do you have all the tabs you need open before I sort them? [y/N] ")
+    if ready.lower() not in ("y", "yes"):
+        print("Open the rest, then run the command again. Nothing was moved.")
+        return
+    print()
+    mode = ask_sort_mode()
+    print()
+    print(f"Reading {len(block)} tabs...", flush=True)
+    jobs = [(tab, *link_parts(tab["url"])) for tab in block]
 
     def run(job):
         tab, device, iface = job
@@ -417,13 +411,12 @@ def main():
         results = list(pool.map(run, jobs))
     missing = []
     for item in results:
+        device, iface = link_parts(item["tab"]["url"])
         if item.get("error"):
             missing.append(item["error"])
         elif mode == "triplet" and not item.get("triplet"):
-            device, iface = link_parts(item["tab"]["url"])
             missing.append(f"{device} {iface}: no rack triplet")
         elif mode == "row" and not item.get("rack"):
-            device, iface = link_parts(item["tab"]["url"])
             missing.append(f"{device} {iface}: no NA/NB row")
     if missing:
         print("\n".join(missing[:12]), file=sys.stderr)
@@ -439,20 +432,13 @@ def main():
     if already:
         print("Already in that order. Nothing was moved.")
         return
-    if DRY:
-        print("Dry run. Nothing was moved.")
-        return
-    answer = ask("Reorder them? The tabs will reload. [y/N] ")
-    if answer.lower() not in ("y", "yes"):
-        print("Nothing was moved.")
-        return
     reorder(
         wid,
         [item["tab"]["tid"] for item in results],
         [item["tab"]["url"] for item in ordered],
-        end["tid"],
+        boundary,
     )
-    label = "triplet" if mode == "triplet" else "row"
+    label = "row" if mode == "row" else "triplet"
     print(f"Done. Walk the tabs left to right by {label}.")
 
 
