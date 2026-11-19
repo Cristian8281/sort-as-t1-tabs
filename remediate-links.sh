@@ -3,8 +3,9 @@
 #
 # Asks whether you are on the NCC capacity dashboard or a FiberMan report
 # sheet. NCC reads the live down-link charts and opens the links for the
-# data hall and discipline you name. A report sheet uses the NCC hyperlinks
-# in the column headed ncc, for the page, location, and discipline you name.
+# data hall and discipline you name. A report sheet lists the pages in the
+# workbook. It then uses the NCC hyperlinks in the column headed ncc, for
+# the page, location, and discipline you pick.
 # Nothing is opened until you confirm the count. The new tabs go in a new
 # window. The existing Network Command Center window is left alone.
 # Those new tabs are sorted by NA/NB row. You can then switch that same
@@ -577,31 +578,50 @@ def cell_text(cell, strings):
     return ""
 
 
-def load_sheet_page(path, title):
+def workbook_pages(path):
     book = zipfile.ZipFile(path)
-    workbook = ET.fromstring(book.read("xl/workbook.xml"))
-    rels = ET.fromstring(book.read("xl/_rels/workbook.xml.rels"))
+    try:
+        workbook = ET.fromstring(book.read("xl/workbook.xml"))
+        rels = ET.fromstring(book.read("xl/_rels/workbook.xml.rels"))
+    finally:
+        book.close()
     targets = {rel.attrib["Id"]: rel.attrib["Target"] for rel in rels}
     pages = []
     for sheet in workbook.findall("m:sheets/m:sheet", NS):
+        if sheet.attrib.get("state") in {"hidden", "veryHidden"}:
+            continue
         name = sheet.attrib["name"]
-        rid = sheet.attrib[RID]
-        target = targets[rid]
+        target = targets[sheet.attrib[RID]]
         if not target.startswith("xl/"):
             target = "xl/" + target
         pages.append((name, target))
-    exact = [item for item in pages if item[0] == title]
-    folded = [item for item in pages if fold(item[0]) == fold(title)]
-    if len(exact) == 1:
-        chosen = exact[0]
-    elif len(folded) == 1:
-        chosen = folded[0]
-        print(f'Using page "{chosen[0]}".')
-    else:
-        print("That page title is not in the sheet. Pages:")
-        for name, _target in pages:
-            print(f"  {name}")
-        return None
+    return pages
+
+
+def choose_page(pages):
+    print()
+    print("Pages:")
+    for index, (name, _target) in enumerate(pages, start=1):
+        print(f"  {index}  {name}")
+    print()
+    if len(pages) == 1:
+        print(f'Using page "{pages[0][0]}".')
+        return pages[0]
+    while True:
+        answer = ask("Which page? ")
+        if answer.isdigit():
+            number = int(answer)
+            if 1 <= number <= len(pages):
+                return pages[number - 1]
+        else:
+            matches = [item for item in pages if item[0] == answer or fold(item[0]) == fold(answer)]
+            if len(matches) == 1:
+                return matches[0]
+        print(f"Type a number from 1 to {len(pages)}.")
+
+
+def load_sheet_page(path, chosen):
+    book = zipfile.ZipFile(path)
     strings = []
     if "xl/sharedStrings.xml" in book.namelist():
         root = ET.fromstring(book.read("xl/sharedStrings.xml"))
@@ -632,12 +652,11 @@ def load_sheet_page(path, title):
 
 def choose_sheet_urls():
     sheet_url = ask("Paste the Google Sheet link: ")
-    title = ask("Type the exact page title: ")
     book = download_sheet(sheet_id_from(sheet_url))
-    loaded = load_sheet_page(book, title)
-    if loaded is None:
-        die("Nothing was opened.")
-    page, cells, link_for = loaded
+    pages = workbook_pages(book)
+    if not pages:
+        die("That sheet has no pages. Nothing was opened.")
+    page, cells, link_for = load_sheet_page(book, choose_page(pages))
     header_row = None
     ncc_col = None
     for row in sorted(cells):
