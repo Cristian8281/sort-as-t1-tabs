@@ -5,6 +5,8 @@
 # range, checks that it can read Chrome and NCC, asks you to confirm every
 # tab is open, then asks whether to sort by NA/NB row or by rack triplet.
 # It then asks if you want to switch that same range between row and triplet.
+# The remediation command passes the new window and starts on row, then
+# asks if you want triplet. You can switch that range back and forth.
 # Duplicate copies of an end tab are included. The span is the leftmost
 # first tab through the rightmost last tab. One copy of each link is kept.
 # The script checks the tab strip after the move and does not say it is
@@ -25,6 +27,7 @@ fi
 exec python3 - "$@" << 'PY'
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -435,9 +438,16 @@ def ask_sort_mode():
     return mode
 
 
-def ask_switch():
+def ask_switch(current=None):
     print()
-    print("Switch this same range back and forth, or leave it.")
+    if current == "row":
+        print("These tabs are in NA/NB row order.")
+        print("Type triplet to sort this same range by rack triplet.")
+    elif current == "triplet":
+        print("These tabs are in rack triplet order.")
+        print("Type row to sort this same range by NA/NB row.")
+    else:
+        print("Switch this same range back and forth, or leave it.")
     print("  row       NA/NB row, alphabetically and numerically (na05, na12, nb05)")
     print("  triplet   rack triplet, alphabetically (RAM, RCK, ZUC)")
     print("  done      leave the tabs as they are")
@@ -554,30 +564,68 @@ def apply_sort(mode, results, wid, boundary):
     return keys
 
 
+def supplied_range():
+    first = os.environ.get("SORT_FIRST_URL", "").strip()
+    last = os.environ.get("SORT_LAST_URL", "").strip()
+    if link_key(first) and link_key(last):
+        return first, last
+    return None
+
+
+def limit_windows(windows):
+    wanted = os.environ.get("SORT_WINDOW_ID", "").strip()
+    if wanted and wanted in windows:
+        return {wanted: windows[wanted]}
+    return windows
+
+
 def main():
-    first_url, last_url = ask_range()
+    supplied = supplied_range()
+    if supplied:
+        first_url, last_url = supplied
+        print("Using the NCC links that were just opened.")
+        print(first_url)
+        print(last_url)
+    else:
+        first_url, last_url = ask_range()
     print()
     windows, cookie = check_access(first_url)
+    windows = limit_windows(windows)
     wid, block, boundary = find_range(windows, first_url, last_url)
     print(f"Found {len(block)} tabs in that range.")
     print()
-    ready = ask("Do you have all the tabs you need open before I sort them? [y/N] ")
-    if ready.lower() not in ("y", "yes"):
-        print("Open the rest, then run the command again. Nothing was moved.")
-        return
-    print()
-    mode = ask_sort_mode()
+    preset = parse_mode(os.environ.get("SORT_MODE", ""))
+    if preset:
+        if preset == "row":
+            print("Sort key: NA/NB row. na05 comes before na12, which comes before nb05.")
+        else:
+            print("Sort key: rack triplet, A to Z. RAM comes before RCK, which comes before ZUC.")
+        print("Tabs with the same key keep their current left-to-right order.")
+        print(f"First tab: {first_url}")
+        print(f"Last tab:  {last_url}")
+        ready = ask("Sort this range that way? [y/N] ")
+        if ready.lower() not in ("y", "yes"):
+            print("Nothing was moved.")
+            return
+        mode = preset
+    else:
+        ready = ask("Do you have all the tabs you need open before I sort them? [y/N] ")
+        if ready.lower() not in ("y", "yes"):
+            print("Open the rest, then run the command again. Nothing was moved.")
+            return
+        print()
+        mode = ask_sort_mode()
     cache = {}
     link_keys = None
     while True:
         print()
         if link_keys is not None:
-            windows = chrome_tabs()
+            windows = limit_windows(chrome_tabs())
             block, boundary = range_by_links(windows, wid, boundary, link_keys)
         print(f"Reading {len(block)} tabs...", flush=True)
         results = load_results(block, cookie, cache)
         link_keys = apply_sort(mode, results, wid, boundary)
-        mode = ask_switch()
+        mode = ask_switch(mode)
         if mode is None:
             print("Left the tabs in that order.")
             return

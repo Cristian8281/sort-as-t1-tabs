@@ -7,6 +7,8 @@
 # in the column headed ncc, for the page, location, and discipline you name.
 # Nothing is opened until you confirm the count. The new tabs go in a new
 # window. The existing Network Command Center window is left alone.
+# Those new tabs are sorted by NA/NB row. You can then switch that same
+# range to rack triplet, and back, until you type done.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/Cristian8281/sort-as-t1-tabs/main/remediate-links.sh | bash
@@ -22,10 +24,15 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 exec python3 - "$@" << 'PY'
+import hashlib
 import json
+import os
 import re
+import sqlite3
 import subprocess
 import time
+import urllib.error
+import urllib.request
 import zipfile
 from collections import Counter
 from pathlib import Path
@@ -106,79 +113,201 @@ def chrome_running():
     return subprocess.run(["pgrep", "-x", "Google Chrome"], stdout=subprocess.DEVNULL).returncode == 0
 
 
-def prom_query(expr):
-    url = QUERY + quote(expr, safe="")
-    text = chrome_text(url)
-    start = text.find("{")
-    if start < 0:
-        die("The capacity dashboard did not return data. Leave that dashboard open in Chrome and run this again. Nothing was opened.")
+def dashboard_url():
+    return (
+        DASHBOARD
+        + "?orgId=1&from=now-5m&to=now&timezone=browser"
+        + f"&var-datasource={DATASOURCE}"
+        + "&var-lifecycle=failure.repairing&var-lifecycle=failure.detected"
+        + "&var-a_location=$__all"
+        + "&var-z_location=$__all"
+        + "&var-link_type=$__all"
+        + "&var-Filters="
+    )
+
+
+def decrypt_cookie(blob, key):
+    if not blob or blob[:3] != b"v10":
+        return None
+    proc = subprocess.run(
+        ["openssl", "enc", "-aes-128-cbc", "-d", "-K", key.hex(), "-iv", (b" " * 16).hex(), "-nopad"],
+        input=blob[3:],
+        capture_output=True,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    raw = proc.stdout
+    pad = raw[-1]
+    if not (1 <= pad <= 16 and raw.endswith(bytes([pad]) * pad)):
+        return None
+    body = raw[:-pad]
+    if len(body) <= 32:
+        return None
     try:
-        payload = json.loads(text[start:])
-    except json.JSONDecodeError:
-        die("The capacity dashboard did not return data. Nothing was opened.")
-    if payload.get("status") != "success":
-        die("The capacity dashboard rejected the query. Nothing was opened.")
-    return payload["data"]["result"]
+        return body[32:].decode()
+    except UnicodeDecodeError:
+        return None
 
 
-def chrome_text(url):
+def grafana_cookie():
+    try:
+        password = subprocess.check_output(
+            ["security", "find-generic-password", "-w", "-s", "Chrome Safe Storage", "-a", "Chrome"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip().encode()
+    except subprocess.CalledProcessError:
+        die("Keychain did not give Chrome Safe Storage. Approve the prompt, then run this again. Nothing was opened.")
+    key = hashlib.pbkdf2_hmac("sha1", password, b"saltysalt", 1003, 16)
+    root = Path.home() / "Library/Application Support/Google/Chrome"
+    for db in sorted(root.glob("*/Cookies")):
+        try:
+            con = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)
+            rows = con.execute(
+                "select name, encrypted_value from cookies "
+                "where host_key = 'supermon.memx.twitter.com'"
+            ).fetchall()
+        except sqlite3.Error:
+            continue
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+        pairs = []
+        for name, blob in rows:
+            value = decrypt_cookie(blob, key)
+            if value:
+                pairs.append(f"{name}={value}")
+        if any(pair.startswith("grafana_session=") for pair in pairs):
+            return "; ".join(pairs)
+    die("No capacity-dashboard login in Chrome. Sign in on that dashboard, then run this again. Nothing was opened.")
+
+
+def dashboard_state(wid):
+    raw = applescript(
+        'tell application "Google Chrome"\n'
+        f"  set w to window id {int(wid)}\n"
+        "  set n to count of tabs of w\n"
+        "  repeat with i from 1 to n\n"
+        '    if URL of tab i of w contains "ff8a05wtt4wsgc" then\n'
+        "      return (loading of tab i of w as text) & linefeed & (title of tab i of w) & linefeed & (URL of tab i of w)\n"
+        "    end if\n"
+        "  end repeat\n"
+        '  return "missing"\n'
+        "end tell"
+    )
+    if raw.strip() == "missing":
+        return None
+    loading, title, url = (raw.splitlines() + ["", "", ""])[:3]
+    return loading.strip(), title.strip(), url.strip()
+
+
+def wait_dashboard(wid):
+    deadline = time.time() + 45
+    while time.time() < deadline:
+        state = dashboard_state(wid)
+        if state is None:
+            return False
+        loading, title, url = state
+        if "accounts.google.com" in url or "/login" in url:
+            die("Chrome is not signed in to the capacity dashboard. Nothing was opened.")
+        if loading == "false" and "Capacity Dashboard" in title:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def find_dashboard_window():
+    raw = applescript(
+        'tell application "Google Chrome"\n'
+        "  repeat with w in windows\n"
+        "    repeat with t in tabs of w\n"
+        '      if URL of t contains "ff8a05wtt4wsgc" then\n'
+        "        return id of w as text\n"
+        "      end if\n"
+        "    end repeat\n"
+        "  end repeat\n"
+        '  return ""\n'
+        "end tell"
+    )
+    return raw.strip()
+
+
+def open_dashboard():
+    wid = applescript(
+        'tell application "Google Chrome"\n'
+        "  set w to make new window\n"
+        f'  set URL of active tab of w to "{dashboard_url()}"\n'
+        "  return id of w as text\n"
+        "end tell"
+    ).strip()
+    return wid
+
+
+def reload_dashboard():
+    raw = applescript(
+        'tell application "Google Chrome"\n'
+        "  repeat with w in windows\n"
+        "    set n to count of tabs of w\n"
+        "    repeat with i from 1 to n\n"
+        '      if URL of tab i of w contains "ff8a05wtt4wsgc" then\n'
+        "        set active tab index of w to i\n"
+        "        reload tab i of w\n"
+        "        return id of w as text\n"
+        "      end if\n"
+        "    end repeat\n"
+        "  end repeat\n"
+        '  return ""\n'
+        "end tell"
+    ).strip()
+    return raw or open_dashboard()
+
+
+def warm_dashboard():
     if not chrome_running():
         die("Google Chrome is not running. Nothing was opened.")
-    clip = subprocess.run(["pbpaste"], stdout=subprocess.PIPE).stdout
-    wid = None
-    try:
-        wid = applescript(
-            'tell application "Google Chrome"\n'
-            "  set w to make new window\n"
-            f'  set URL of active tab of w to "{url}"\n'
-            "  set index of w to 1\n"
-            "  activate\n"
-            "  return id of w as text\n"
-            "end tell"
-        ).strip()
-        deadline = time.time() + 25
-        while time.time() < deadline:
-            state = applescript(
-                f'tell application "Google Chrome" to loading of active tab of window id {wid} as text'
-            ).strip()
-            if state == "false":
-                break
-            time.sleep(0.4)
-        time.sleep(0.5)
-        applescript(
-            "tell application \"Google Chrome\"\n"
-            f"  set index of window id {wid} to 1\n"
-            "  activate\n"
-            "  set b to bounds of window id " + wid + "\n"
-            "  set cx to ((item 1 of b) + (item 3 of b)) / 2\n"
-            "  set cy to ((item 2 of b) + (item 4 of b)) / 2\n"
-            "end tell\n"
-            "tell application \"System Events\"\n"
-            "  tell process \"Google Chrome\"\n"
-            "    set frontmost to true\n"
-            "    delay 0.3\n"
-            "    click at {cx, cy}\n"
-            "    delay 0.2\n"
-            '    keystroke "a" using command down\n'
-            "    delay 0.2\n"
-            '    keystroke "c" using command down\n'
-            "  end tell\n"
-            "end tell"
+    wid = find_dashboard_window()
+    if not wid:
+        print("Opening the capacity dashboard.")
+        wid = open_dashboard()
+    if not wait_dashboard(wid):
+        die("The capacity dashboard did not finish loading. Nothing was opened.")
+    time.sleep(0.6)
+    return wid
+
+
+def prom_query(expr):
+    url = QUERY + quote(expr, safe="")
+    last_error = "no response"
+    for attempt in range(3):
+        if attempt:
+            print("Refreshing the capacity dashboard login.")
+            wid = reload_dashboard()
+            wait_dashboard(wid)
+            time.sleep(0.8)
+        request = urllib.request.Request(
+            url,
+            headers={
+                "cookie": grafana_cookie(),
+                "accept": "application/json",
+                "origin": "https://supermon.memx.twitter.com",
+                "x-grafana-org-id": "1",
+            },
         )
-        time.sleep(0.3)
-        copied = subprocess.run(["pbpaste"], stdout=subprocess.PIPE).stdout
-    finally:
-        subprocess.run(["pbcopy"], input=clip)
-        if wid:
-            subprocess.run(
-                ["osascript", "-e", f'tell application "Google Chrome" to close window id {wid}'],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-    try:
-        return copied.decode()
-    except UnicodeDecodeError:
-        return copied.decode("utf-8", "replace")
+        try:
+            with urllib.request.urlopen(request, timeout=60) as resp:
+                payload = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            last_error = exc.read().decode(errors="replace")[:180]
+            continue
+        except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
+            last_error = str(exc)
+            continue
+        if payload.get("status") == "success":
+            return payload["data"]["result"]
+        last_error = str(payload.get("error") or payload.get("messageId") or "rejected")
+    die(f"The capacity dashboard rejected the query. {last_error} Nothing was opened.")
 
 
 def pct(value):
@@ -258,9 +387,20 @@ def choose_source():
         print("Type ncc or sheet.")
 
 
+def normalize_place(place):
+    token = re.sub(r"[\s.]+", "", (place or "").strip().lower())
+    match = re.fullmatch(r"dh(\d+)", token)
+    if match:
+        return "dh" + match.group(1).zfill(2)
+    if token.isdigit():
+        return "dh" + token.zfill(2)
+    return token
+
+
 def choose_ncc():
     print("Reading the capacity dashboard. Threshold is 0.500%.")
     print()
+    warm_dashboard()
     as_rows = chart_rows(ratio_expr("as:sis-t1"), "z_device_location")
     t1_rows = chart_rows(ratio_expr("sis-t1:sis-t2"), "z_device_location")
     spine_rows = chart_rows(spine_expr(), "device_spine")
@@ -296,15 +436,18 @@ def choose_ncc():
     # print_chart already printed only the red rows. Re-print is enough.
     link_type = LINK_TYPES[key]
     place = where.strip()
-    if key == "t2-t3" and HALL_RE.match(fold(place).replace(" ", "")) is None and not place.lower().startswith("sc"):
+    bare = fold(place).replace(" ", "")
+    if key == "t2-t3" and HALL_RE.match(bare) is None and not place.lower().startswith("sc"):
         urls = spine_links(place)
+        shown = place
     else:
-        urls = location_links(link_type, place)
-    return title, place, link_type, urls
+        shown = normalize_place(place)
+        urls = location_links(link_type, shown)
+    return title, shown, link_type, urls
 
 
 def location_links(link_type, place):
-    loc = place.strip().lower()
+    loc = normalize_place(place)
     expr = (
         'netcollector_link_assignment{environment="production",link_type="%s",'
         'z_device_location="%s",lifecycle=~"failure.repairing|failure.detected"}'
@@ -602,13 +745,27 @@ def open_window(urls):
     def same(left, right):
         return unquote(left).rstrip("/") == unquote(right).rstrip("/")
 
-    if len(check) < 3 or int(check[0]) != len(urls) or not same(check[1], urls[0]) or not same(check[2], urls[-1]):
-        die("The new window does not match the link list. Nothing more was opened.")
-    return wid
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        if len(check) >= 3 and int(check[0]) == len(urls) and same(check[1], urls[0]) and same(check[2], urls[-1]):
+            return wid
+        time.sleep(0.4)
+        check = applescript(
+            "tell application \"Google Chrome\"\n"
+            f"  set n to count of tabs of window id {wid}\n"
+            "  set firstUrl to URL of tab 1 of window id " + wid + "\n"
+            "  set lastUrl to URL of last tab of window id " + wid + "\n"
+            "  return (n as text) & linefeed & firstUrl & linefeed & lastUrl\n"
+            "end tell"
+        ).splitlines()
+    die("The new window does not match the link list. Nothing more was opened.")
 
 
 def set_dashboard_filters(place, link_type):
-    token = place.strip().lower()
+    token = re.sub(r"[\s.]+", "", (place or "").strip().lower())
+    match = re.fullmatch(r"dh(\d+)", token)
+    if match:
+        token = "dh" + match.group(1).zfill(2)
     loc = token if HALL_RE.match(token) or token.startswith("sc") else "$__all"
     filtered = (
         DASHBOARD
@@ -646,17 +803,18 @@ def confirm_and_open(urls):
         print(urls[-1])
     if not yes(ask(f"Open these {count} links in a new window? [y/N] ")):
         die("Nothing was opened.")
-    open_window(urls)
+    wid = open_window(urls)
     print()
     print("The new window is only these links.")
-    print("Starting the sorter in this Terminal.")
-    print("Paste this first tab:")
-    print(f"  {urls[0]}")
-    print("Paste this last tab:")
-    print(f"  {urls[-1]}")
-    print("Same row or triplet keeps the current order.")
+    print("Sorting that window by NA/NB row. Same row keeps the current order.")
+    print("After the sort, you can switch this same range to triplet, and back.")
     print()
-    raise SystemExit(subprocess.call(["bash", "-lc", SORTER]))
+    env = os.environ.copy()
+    env["SORT_FIRST_URL"] = urls[0]
+    env["SORT_LAST_URL"] = urls[-1]
+    env["SORT_WINDOW_ID"] = wid
+    env["SORT_MODE"] = "row"
+    raise SystemExit(subprocess.call(["bash", "-lc", SORTER], env=env))
 
 
 def main():
