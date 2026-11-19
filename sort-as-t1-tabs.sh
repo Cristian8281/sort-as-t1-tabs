@@ -4,6 +4,7 @@
 # After you paste the command, it asks for the first and last tab in the
 # range, checks that it can read Chrome and NCC, asks you to confirm every
 # tab is open, then asks whether to sort by NA/NB row or by rack triplet.
+# It then asks if you want to switch that same range between row and triplet.
 # Duplicate copies of an end tab are included. The span is the leftmost
 # first tab through the rightmost last tab. One copy of each link is kept.
 # The script checks the tab strip after the move and does not say it is
@@ -415,43 +416,90 @@ def summarize(ordered, field):
     return ", ".join(f"{name} x{count}" for name, count in groups)
 
 
-def ask_sort_mode():
-    print("How should they be sorted?")
-    print("  row       NA/NB row, alphabetically and numerically (na05, na12, nb05)")
-    print("  triplet   rack triplet, alphabetically (RAM, RCK, ZUC)")
-    raw = ask("Sort by [row/triplet]: ").lower()
+def parse_mode(raw):
+    raw = raw.lower()
     if raw in ("r", "row", "1", "na", "nb", "na/nb"):
         return "row"
     if raw in ("t", "triplet", "2"):
         return "triplet"
-    die("Type row or triplet. Nothing was moved.")
+    return None
 
 
-def main():
-    first_url, last_url = ask_range()
-    print()
-    windows, cookie = check_access(first_url)
-    wid, block, boundary = find_range(windows, first_url, last_url)
-    print(f"Found {len(block)} tabs in that range.")
-    print()
-    ready = ask("Do you have all the tabs you need open before I sort them? [y/N] ")
-    if ready.lower() not in ("y", "yes"):
-        print("Open the rest, then run the command again. Nothing was moved.")
-        return
-    print()
-    mode = ask_sort_mode()
-    print()
-    print(f"Reading {len(block)} tabs...", flush=True)
-    jobs = [(tab, *link_parts(tab["url"])) for tab in block]
+def ask_sort_mode():
+    print("How should they be sorted?")
+    print("  row       NA/NB row, alphabetically and numerically (na05, na12, nb05)")
+    print("  triplet   rack triplet, alphabetically (RAM, RCK, ZUC)")
+    mode = parse_mode(ask("Sort by [row/triplet]: "))
+    if mode is None:
+        die("Type row or triplet. Nothing was moved.")
+    return mode
 
-    def run(job):
-        tab, device, iface = job
-        result = lookup(cookie, device, iface)
-        result["tab"] = tab
-        return result
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(run, jobs))
+def ask_switch():
+    print()
+    print("Switch this same range back and forth, or leave it.")
+    print("  row       NA/NB row, alphabetically and numerically (na05, na12, nb05)")
+    print("  triplet   rack triplet, alphabetically (RAM, RCK, ZUC)")
+    print("  done      leave the tabs as they are")
+    while True:
+        raw = ask("Switch to [row/triplet/done]: ").lower()
+        if raw in ("", "n", "no", "d", "done", "q", "quit"):
+            return None
+        mode = parse_mode(raw)
+        if mode:
+            return mode
+        print("Type row, triplet, or done.")
+
+
+def range_by_links(windows, window_id, boundary_id, link_keys):
+    tabs = windows.get(str(window_id))
+    if not tabs:
+        die("Lost the Chrome window. Nothing more was moved.")
+    if boundary_id:
+        end = next((i for i, tab in enumerate(tabs) if tab["tid"] == boundary_id), None)
+        if end is None:
+            die("The tab after the range moved. Nothing more was moved.")
+    else:
+        end = len(tabs)
+    start = end - len(link_keys)
+    if start < 0:
+        die("The range changed. Nothing more was moved.")
+    block = tabs[start:end]
+    if {link_key(tab["url"]) for tab in block} != link_keys:
+        die("The range changed. Nothing more was moved.")
+    return block, boundary_id or ""
+
+
+def load_results(block, cookie, cache):
+    jobs = []
+    for tab in block:
+        key = link_key(tab["url"])
+        if key not in cache:
+            device, iface = link_parts(tab["url"])
+            jobs.append((key, device, iface))
+    if jobs:
+        def run(job):
+            key, device, iface = job
+            result = lookup(cookie, device, iface)
+            result["key"] = key
+            return result
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for result in pool.map(run, jobs):
+                cache[result["key"]] = result
+    loaded = []
+    for tab in block:
+        saved = cache[link_key(tab["url"])]
+        loaded.append({
+            "triplet": saved.get("triplet"),
+            "rack": saved.get("rack"),
+            "remote": saved.get("remote"),
+            "error": saved.get("error"),
+            "tab": tab,
+        })
+    return loaded
+
+
+def apply_sort(mode, results, wid, boundary):
     missing = []
     for item in results:
         device, iface = link_parts(item["tab"]["url"])
@@ -490,9 +538,11 @@ def main():
             continue
         seen.add(key)
         current.append(item["tab"]["tid"])
+    label = "row" if mode == "row" else "triplet"
+    keys = {link_key(item["tab"]["url"]) for item in kept}
     if dropped == 0 and current == [item["tab"]["tid"] for item in kept]:
-        print("Already in that order. Nothing was moved.")
-        return
+        print(f"Already in {label} order. Nothing was moved.")
+        return keys
     print(f"Reordering {len(kept)} tabs. They will reload.", flush=True)
     reorder(
         wid,
@@ -500,8 +550,37 @@ def main():
         [item["tab"]["url"] for item in kept],
         boundary,
     )
-    label = "row" if mode == "row" else "triplet"
     print(f"Done. Walk the tabs left to right by {label}.")
+    return keys
+
+
+def main():
+    first_url, last_url = ask_range()
+    print()
+    windows, cookie = check_access(first_url)
+    wid, block, boundary = find_range(windows, first_url, last_url)
+    print(f"Found {len(block)} tabs in that range.")
+    print()
+    ready = ask("Do you have all the tabs you need open before I sort them? [y/N] ")
+    if ready.lower() not in ("y", "yes"):
+        print("Open the rest, then run the command again. Nothing was moved.")
+        return
+    print()
+    mode = ask_sort_mode()
+    cache = {}
+    link_keys = None
+    while True:
+        print()
+        if link_keys is not None:
+            windows = chrome_tabs()
+            block, boundary = range_by_links(windows, wid, boundary, link_keys)
+        print(f"Reading {len(block)} tabs...", flush=True)
+        results = load_results(block, cookie, cache)
+        link_keys = apply_sort(mode, results, wid, boundary)
+        mode = ask_switch()
+        if mode is None:
+            print("Left the tabs in that order.")
+            return
 
 
 if __name__ == "__main__":
